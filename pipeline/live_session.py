@@ -1,16 +1,4 @@
-"""
-pipeline/live_session.py
-────────────────────────
-Manages the Gemini Live websocket session.
-
-Audio flows:
-  Mic (continuous real audio) → websocket → Gemini VAD handles turns
-  Websocket (audio chunk) → dedicated player thread → speaker
-
-Tool flows:
-  Websocket (tool call event) → local Python function
-  Local result → websocket (tool response event)
-"""
+# pipeline/live_session.py
 
 import asyncio
 import threading
@@ -24,10 +12,9 @@ from tools.gmail_send import send_email
 from tools.gmail_read import read_inbox
 from config import GEMINI_API_KEY
 
-# v1alpha — stable session behaviour after turn_complete
 client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options={"api_version": "v1alpha"}
+    http_options={"api_version": "v1beta"}
 )
 
 VOICE_NAME = "Aoede"
@@ -49,8 +36,8 @@ TOOL_DISPATCH = {
 }
 
 
-def _audio_player_thread(audio_q: thread_queue.Queue):
-    stream = get_output_stream()    # same _pa, no conflict
+def _audio_player_thread(audio_q: thread_queue.Queue, gemini_speaking: threading.Event):
+    stream = get_output_stream()
     print("🔊 Audio player thread ready")
     while True:
         chunk = audio_q.get()
@@ -63,7 +50,8 @@ def _audio_player_thread(audio_q: thread_queue.Queue):
     stream.stop_stream()
     stream.close()
 
-async def _stream_mic(session):
+
+async def _stream_mic(session, gemini_speaking: threading.Event):
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
 
@@ -78,10 +66,16 @@ async def _stream_mic(session):
     try:
         while True:
             chunk = await queue.get()
-            await session.send_realtime_input(          # ← was: audio=chunk (raw bytes)
+
+            # ── Mute gate: drop mic audio while Gemini is speaking ──────────
+            if gemini_speaking.is_set():
+                continue
+            # ────────────────────────────────────────────────────────────────
+
+            await session.send_realtime_input(
                 audio=types.Blob(
                     data=chunk,
-                    mime_type="audio/pcm;rate=16000"    # must match INPUT_RATE in audio_stream.py
+                    mime_type="audio/pcm;rate=16000"
                 )
             )
     except asyncio.CancelledError:
@@ -98,10 +92,13 @@ async def _stream_mic(session):
 async def run_live():
     loop = asyncio.get_event_loop()
 
+    # Shared flag: set while Gemini audio is playing, mic is gated off
+    gemini_speaking = threading.Event()
+
     audio_q = thread_queue.Queue()
     player_thread = threading.Thread(
         target=_audio_player_thread,
-        args=(audio_q,),
+        args=(audio_q, gemini_speaking),
         daemon=True
     )
     player_thread.start()
@@ -109,7 +106,7 @@ async def run_live():
     config = types.LiveConnectConfig(
         system_instruction=types.Content(parts=[types.Part.from_text(text=SYSTEM_PROMPT)]),
         tools=[{"function_declarations": TOOL_DEFINITIONS}],
-        response_modalities=["AUDIO"],
+        response_modalities=["audio"],
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -119,45 +116,50 @@ async def run_live():
         )
     )
 
-    async with client.aio.live.connect(model="gemini-3.1-flash-live-preview", config=config) as session:
+    async with client.aio.live.connect(model="gemini-2.5-flash-native-audio-latest", config=config) as session:
         print("\n=======================================================")
         print("🔗 Connected to Gemini Live!")
         print("⏹️  Press Ctrl+C to stop.")
         print("=======================================================\n")
 
-        # Trigger greeting
-        await session.send_realtime_input(activity_start=types.ActivityStart())
-        await session.send_realtime_input(
-            text="Please greet the user and introduce yourself as their Gmail voice assistant."
-        )
-        await session.send_realtime_input(activity_end=types.ActivityEnd())
+        await session.send_client_content(
+        turns=types.Content(
+            role="user",
+            parts=[types.Part.from_text(
+                text="Please greet the user and introduce yourself as their Gmail voice assistant."
+            )]
+        ),
+        turn_complete=True
+)
         print("⏳ Waiting for greeting...\n")
 
-        # Start mic immediately — real audio keeps session alive
-        mic_task = asyncio.create_task(_stream_mic(session))
+        mic_task = asyncio.create_task(_stream_mic(session, gemini_speaking))
 
         greeting_done = False
 
         try:
-            while True:  # restart receive() iterator if it exhausts
+            while True:
                 async for response in session.receive():
 
-                    # 1. Audio from Gemini
                     if response.server_content is not None:
                         model_turn = response.server_content.model_turn
                         if model_turn is not None:
                             for part in model_turn.parts:
                                 if part.inline_data is not None:
+                                    gemini_speaking.set()       # ← gate mic off
                                     audio_q.put_nowait(part.inline_data.data)
 
                         if response.server_content.turn_complete:
+                            # Small delay so the last audio chunk finishes
+                            # playing before the mic reopens
+                            await asyncio.sleep(0.4)
+                            gemini_speaking.clear()             # ← gate mic on
                             if not greeting_done:
                                 greeting_done = True
                                 print("✅ Greeting done — speak now!\n")
                             else:
                                 print("✅ Response done — listening...\n")
 
-                    # 2. Tool calls
                     if response.tool_call is not None:
                         for fc in response.tool_call.function_calls:
                             name = fc.name
@@ -182,7 +184,6 @@ async def run_live():
                                 ]
                             )
 
-                # Iterator exhausted — brief pause then restart
                 await asyncio.sleep(0.1)
 
         except asyncio.CancelledError:
@@ -195,5 +196,4 @@ async def run_live():
             mic_task.cancel()
             audio_q.put(None)
             player_thread.join(timeout=2)
-            terminate()          # calls audio_stream._pa.terminate() — clean single shutdown
             print("\n👋 Session ended.")
