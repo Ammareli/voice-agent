@@ -5,3 +5,4 @@ sounddevice>=0.4.6
 scipy>=1.11.0
 python-dotenv>=1.0.0
 numpy>=1.24.0
+google-generativeai>=0.8.0\npyaudio>=0.2.14
