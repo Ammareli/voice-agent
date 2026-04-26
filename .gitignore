@@ -1,0 +1,18 @@
+# ── Voice-to-Action Gmail Bot ──────────────────────────────────────────────
+# Sensitive files
+.env
+auth/token.json
+auth/credentials.json
+
+# Audio scratch files
+*.wav
+*.mp3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
